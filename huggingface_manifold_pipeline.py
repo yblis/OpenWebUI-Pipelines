@@ -1,102 +1,104 @@
 import os
-from transformers import pipeline
-from huggingface_hub import login
-from transformers.pipelines import PipelineException
+import requests
+import json
+from typing import List, Union, Generator, Iterator
+from pydantic import BaseModel
+
+from utils.pipelines.main import pop_system_message
 
 
-class HuggingFaceChatPipeline:
-    def __init__(self, api_key: str, model_id: str):
-        """
-        Initialisation de la classe pour interagir avec un modèle Hugging Face.
+class Pipeline:
+    class Valves(BaseModel):
+        HUGGINGFACE_API_KEY: str = ""
 
-        :param api_key: Clé API Hugging Face.
-        :param model_id: Identifiant du modèle à utiliser.
-        """
-        self.api_key = api_key
-        self.model_id = model_id
-        self.pipeline = None
+    def __init__(self):
+        self.type = "manifold"
+        self.id = "huggingface"
+        self.name = "huggingface/"
 
-    def authenticate(self):
-        """
-        Authentifie auprès de Hugging Face en utilisant la clé API.
-        """
+        self.valves = self.Valves(
+            **{"HUGGINGFACE_API_KEY": os.getenv("HUGGINGFACE_API_KEY", "your-api-key-here")}
+        )
+        self.url = "https://huggingface.co/api/models"
+        self.update_headers()
+
+    def update_headers(self):
+        self.headers = {
+            "Authorization": f"Bearer {self.valves.HUGGINGFACE_API_KEY}",
+            "Content-Type": "application/json",
+        }
+
+    def get_huggingface_models(self):
         try:
-            login(token=self.api_key)
-            print("Authentification réussie.")
-        except Exception as e:
-            print(f"Erreur d'authentification : {e}")
-            raise
+            params = {"limit": 100}  # Nombre de modèles à récupérer par requête
+            response = requests.get(self.url, headers=self.headers, params=params)
+            response.raise_for_status()
+            models = response.json()
+            return [
+                {"id": model["modelId"], "name": model["modelId"]}
+                for model in models
+            ]
+        except requests.exceptions.RequestException as e:
+            return [
+                {"id": "error", "name": f"Error fetching models: {str(e)}"}
+            ]
 
-    def initialize_pipeline(self):
-        """
-        Initialise le pipeline pour interagir avec le modèle spécifié.
-        """
+    async def on_startup(self):
+        print(f"on_startup:{__name__}")
+        pass
+
+    async def on_shutdown(self):
+        print(f"on_shutdown:{__name__}")
+        pass
+
+    async def on_valves_updated(self):
+        self.update_headers()
+
+    def pipelines(self) -> List[dict]:
+        return self.get_huggingface_models()
+
+    def pipe(
+        self, user_message: str, model_id: str, messages: List[dict], body: dict
+    ) -> Union[str, Generator, Iterator]:
         try:
-            self.pipeline = pipeline("text-generation", model=self.model_id, use_auth_token=self.api_key)
-            print(f"Pipeline initialisé avec succès pour le modèle {self.model_id}.")
+            # Prepare the payload
+            payload = {
+                "inputs": user_message,
+                "parameters": {
+                    "max_new_tokens": body.get("max_tokens", 50),
+                    "temperature": body.get("temperature", 0.8),
+                    "top_k": body.get("top_k", 40),
+                    "top_p": body.get("top_p", 0.9),
+                },
+            }
+
+            if body.get("stream", False):
+                return self.stream_response(model_id, payload)
+            else:
+                return self.get_completion(model_id, payload)
         except Exception as e:
-            print(f"Erreur lors de l'initialisation du pipeline : {e}")
-            raise
+            return f"Error: {e}"
 
-    def chat(self, user_input: str, max_tokens: int = 50, temperature: float = 0.8) -> str:
-        """
-        Envoie une requête au modèle et retourne la réponse générée.
-
-        :param user_input: Texte d'entrée de l'utilisateur.
-        :param max_tokens: Nombre maximum de tokens pour la réponse.
-        :param temperature: Température pour contrôler la créativité de la réponse.
-        :return: Texte généré par le modèle.
-        """
-        if not self.pipeline:
-            print("Pipeline non initialisé. Appelez `initialize_pipeline` d'abord.")
-            return "Erreur : Pipeline non initialisé."
-
+    def stream_response(self, model_id: str, payload: dict) -> Generator:
         try:
-            response = self.pipeline(
-                user_input,
-                max_length=max_tokens,
-                temperature=temperature,
-                return_full_text=False
-            )
-            return response[0]["generated_text"]
-        except PipelineException as e:
-            print(f"Erreur dans le pipeline : {e}")
-            return "Erreur : Impossible de générer une réponse."
-        except Exception as e:
-            print(f"Une erreur est survenue : {e}")
-            return "Erreur : Problème inconnu."
+            response = requests.post(f"https://api-inference.huggingface.co/models/{model_id}", headers=self.headers, json=payload, stream=True)
+            response.raise_for_status()
 
-    def test_chat(self):
-        """
-        Teste le pipeline avec un exemple de requête.
-        """
-        user_input = "Bonjour, comment allez-vous ?"
-        print("Utilisateur :", user_input)
-        response = self.chat(user_input)
-        print("Modèle :", response)
+            for line in response.iter_lines():
+                if line:
+                    try:
+                        data = json.loads(line.decode("utf-8"))
+                        yield data.get("generated_text", "")
+                    except json.JSONDecodeError:
+                        yield "Error parsing JSON response"
+        except requests.exceptions.RequestException as e:
+            yield f"Error: {e}"
 
-
-if __name__ == "__main__":
-    # Remplacez par votre clé API Hugging Face
-    API_KEY = os.getenv("HUGGINGFACE_API_KEY", "votre_clé_api")
-    MODEL_ID = "Qwen/QwQ-32B-Preview"  # Exemple de modèle
-
-    # Initialisation de la classe
-    chat_pipeline = HuggingFaceChatPipeline(api_key=API_KEY, model_id=MODEL_ID)
-
-    # Authentification auprès de Hugging Face
-    try:
-        chat_pipeline.authenticate()
-    except Exception:
-        print("Impossible de s'authentifier.")
-        exit()
-
-    # Initialisation du pipeline
-    try:
-        chat_pipeline.initialize_pipeline()
-    except Exception:
-        print("Impossible d'initialiser le pipeline.")
-        exit()
-
-    # Test de la conversation
-    chat_pipeline.test_chat()
+    def get_completion(self, model_id: str, payload: dict) -> str:
+        try:
+            response = requests.post(f"https://api-inference.huggingface.co/models/{model_id}", headers=self.headers, json=payload)
+            response.raise_for_status()
+            result = response.json()
+            return result.get("generated_text", "")
+        except requests.exceptions.RequestException as e:
+            return f"Error: {e}"
